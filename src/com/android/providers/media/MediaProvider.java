@@ -1900,6 +1900,18 @@ public class MediaProvider extends ContentProvider {
                     + " AND datetaken<date_modified*5;");
         }
 
+        if (fromVersion < 701) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS bookmarks (" +
+                " _id INTEGER PRIMARY KEY," +
+                " _data TEXT," +
+                " _display_name TEXT," +
+                " position INTEGER," +
+                " date_added INTEGER," +
+                " mime_type TEXT," +
+                " media_type TEXT" +
+                ");");
+        }
+
        if (fromVersion < 800) {
             // Delete albums and artists, then clear the modification time on songs, which
             // will cause the media scanner to rescan everything, rebuilding the artist and
@@ -2323,7 +2335,7 @@ public class MediaProvider extends ContentProvider {
 
         // Used temporarily (until we have unique media IDs) to get an identifier
         // for the current sd card, so that the music app doesn't have to use the
-        // non-public getFatVolumeId method
+        // non-public getVolumeId method
         if (table == FS_ID) {
             MatrixCursor c = new MatrixCursor(new String[] {"fsid"});
             c.addRow(new Integer[] {mVolumeId});
@@ -2684,7 +2696,13 @@ public class MediaProvider extends ContentProvider {
             case MTP_OBJECT_REFERENCES:
                 int handle = Integer.parseInt(uri.getPathSegments().get(2));
                 return getObjectReferences(helper, db, handle);
-
+            case MEDIA_BOOKMARK:
+                qb.setTables("bookmarks");
+                break;
+            case MEDIA_BOOKMARK_ID:
+                qb.setTables("bookmarks");
+                qb.appendWhere("_id = " + uri.getPathSegments().get(2));
+                break;
             default:
                 throw new IllegalStateException("Unknown URL: " + uri.toString());
         }
@@ -2863,6 +2881,19 @@ public class MediaProvider extends ContentProvider {
                     mMtpService.sendObjectRemoved((int)objectHandle);
                 } catch (RemoteException e) {
                     Log.e(TAG, "RemoteException in sendObjectRemoved", e);
+                    mMtpService = null;
+                }
+            }
+        }
+    }
+
+    private void sendObjectUpdated(long objectHandle) {
+        synchronized (mMtpServiceConnection) {
+            if (mMtpService != null) {
+                try {
+                    mMtpService.sendObjectUpdated((int)objectHandle);
+                } catch (RemoteException e) {
+                    Log.e(TAG, "RemoteException in sendObjectUpdated", e);
                     mMtpService = null;
                 }
             }
@@ -3688,6 +3719,13 @@ public class MediaProvider extends ContentProvider {
                 }
                 break;
 
+            case MEDIA_BOOKMARK:
+                rowId = db.insert("bookmarks", "mime_type", initialValues);
+                if (rowId > 0) {
+                    newUri = ContentUris.withAppendedId(uri, rowId);
+                }
+                break;
+
             default:
                 throw new UnsupportedOperationException("Invalid URI " + uri);
         }
@@ -4093,6 +4131,13 @@ public class MediaProvider extends ContentProvider {
             case FILES:
             case MTP_OBJECTS:
                 out.table = "files";
+                break;
+
+            case MEDIA_BOOKMARK_ID:
+                where = "_id=" + uri.getPathSegments().get(2);
+                // fall through
+            case MEDIA_BOOKMARK:
+                out.table = "bookmarks";
                 break;
 
             default:
@@ -4527,6 +4572,11 @@ public class MediaProvider extends ContentProvider {
                                         + count + " match = " + match);
                             }
                         }
+                        if (count > 0) {
+                            helper.mNumQueries++;
+                            notifyMtpUpdated(sGetTableAndWhereParam.table, db,
+                                    sGetTableAndWhereParam.where, whereArgs);
+                        }
                     }
                     break;
                 case IMAGES_MEDIA:
@@ -4571,6 +4621,11 @@ public class MediaProvider extends ContentProvider {
                                 }
                             }
                         }
+                        if (count > 0) {
+                            helper.mNumQueries++;
+                            notifyMtpUpdated(sGetTableAndWhereParam.table, db,
+                                    sGetTableAndWhereParam.where, whereArgs);
+                        }
                     }
                     break;
 
@@ -4593,6 +4648,11 @@ public class MediaProvider extends ContentProvider {
                     helper.mNumUpdates++;
                     count = db.update(sGetTableAndWhereParam.table, initialValues,
                         sGetTableAndWhereParam.where, whereArgs);
+                    if (count > 0) {
+                        helper.mNumQueries++;
+                        notifyMtpUpdated(sGetTableAndWhereParam.table, db,
+                                sGetTableAndWhereParam.where, whereArgs);
+                    }
                     break;
             }
         }
@@ -4602,6 +4662,20 @@ public class MediaProvider extends ContentProvider {
             getContext().getContentResolver().notifyChange(uri, null);
         }
         return count;
+    }
+
+    private void notifyMtpUpdated(String table, SQLiteDatabase db,
+            String userWhere, String[] whereArgs) {
+        Cursor c = db.query(table, ID_PROJECTION, userWhere, whereArgs, null, null, null);
+        if (c != null) {
+            try {
+                while (c.moveToNext()) {
+                    sendObjectUpdated(c.getLong(0));
+                }
+            } finally {
+                c.close();
+            }
+        }
     }
 
     private int movePlaylistEntry(DatabaseHelper helper, SQLiteDatabase db,
@@ -5498,11 +5572,11 @@ public class MediaProvider extends ContentProvider {
                 helper = new DatabaseHelper(context, INTERNAL_DATABASE_NAME, true,
                         false, mObjectRemovedCallback);
             } else if (EXTERNAL_VOLUME.equals(volume)) {
-                // Only extract FAT volume ID for primary public
+                // Only extract volume ID for primary public
                 final VolumeInfo vol = mStorageManager.getPrimaryPhysicalVolume();
                 if (vol != null) {
                     final StorageVolume actualVolume = mStorageManager.getPrimaryVolume();
-                    final int volumeId = actualVolume.getFatVolumeId();
+                    final int volumeId = actualVolume.getVolumeId();
 
                     // Must check for failure!
                     // If the volume is not (yet) mounted, this will create a new
@@ -5515,8 +5589,8 @@ public class MediaProvider extends ContentProvider {
                                 Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
                             // This may happen if external storage was _just_ mounted.  It may also
                             // happen if the volume ID is _actually_ 0xffffffff, in which case it
-                            // must be changed since FileUtils::getFatVolumeId doesn't allow for
-                            // that.  It may also indicate that FileUtils::getFatVolumeId is broken
+                            // must be changed since FileUtils::getVolumeId doesn't allow for
+                            // that.  It may also indicate that FileUtils::getVolumeId is broken
                             // (missing ioctl), which is also impossible to disambiguate.
                             Log.e(TAG, "Can't obtain external volume ID even though it's mounted.");
                         } else {
@@ -5679,7 +5753,7 @@ public class MediaProvider extends ContentProvider {
     // name of the volume currently being scanned by the media scanner (or null)
     private String mMediaScannerVolume;
 
-    // current FAT volume ID
+    // current volume ID
     private int mVolumeId = -1;
 
     static final String INTERNAL_VOLUME = "internal";
@@ -5747,6 +5821,8 @@ public class MediaProvider extends ContentProvider {
     // UsbReceiver calls insert() and delete() with this URI to tell us
     // when MTP is connected and disconnected
     private static final int MTP_CONNECTED = 705;
+    private static final int MEDIA_BOOKMARK = 1101;
+    private static final int MEDIA_BOOKMARK_ID = 1102;
 
     private static final UriMatcher URI_MATCHER =
             new UriMatcher(UriMatcher.NO_MATCH);
@@ -5845,6 +5921,8 @@ public class MediaProvider extends ContentProvider {
         // used by the music app's search activity
         URI_MATCHER.addURI("media", "*/audio/search/fancy", AUDIO_SEARCH_FANCY);
         URI_MATCHER.addURI("media", "*/audio/search/fancy/*", AUDIO_SEARCH_FANCY);
+        URI_MATCHER.addURI("media", "*/bookmark", MEDIA_BOOKMARK);
+        URI_MATCHER.addURI("media", "*/bookmark/#", MEDIA_BOOKMARK_ID);
     }
 
     private static String getVolumeName(Uri uri) {
